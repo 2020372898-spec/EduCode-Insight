@@ -25,6 +25,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 
 from pipeline import FeedbackValidator, AssignmentContext
+from pipeline.supabase_repository import SupabaseRepository
 
 from pipeline.core import (
     BATCH_SIZE,
@@ -895,6 +896,28 @@ def authenticate_lecturer(
 
 
 # ============================================================
+# SUPABASE PERSISTENCE
+# ============================================================
+
+@st.cache_resource
+def _cached_supabase_repository():
+    return SupabaseRepository()
+
+
+def supabase_repository():
+    """Return the persistent repository when Supabase secrets are configured.
+
+    Local JSON remains the fallback/cache so development still works offline.
+    """
+    try:
+        if not st.secrets.get("SUPABASE_URL") or not st.secrets.get("SUPABASE_KEY"):
+            return None
+        return _cached_supabase_repository()
+    except Exception:
+        return None
+
+
+# ============================================================
 # USER STORAGE
 # ============================================================
 
@@ -988,144 +1011,113 @@ def assignment_meta_path(
 
 
 def list_stored_assignments():
-    assignments = []
+    """List practicals from Supabase, with local JSON as a fallback/cache."""
+    assignments_by_slug = {}
+    user_id = st.session_state.get("user_id")
+    repo = supabase_repository()
 
-    for folder in (
-        assignments_root()
-        .iterdir()
-    ):
+    if repo is not None and user_id:
+        try:
+            for practical in repo.list_practicals(str(user_id)):
+                slug = str(practical.get("slug", "")).strip()
+                name = str(practical.get("name", slug)).strip()
+                if slug:
+                    assignments_by_slug[slug] = name
+        except Exception:
+            # Keep the app usable from its local cache if cloud storage is unavailable.
+            pass
+
+    for folder in assignments_root().iterdir():
         if not folder.is_dir():
             continue
-
-        meta_path = (
-            folder
-            /
-            "_assignment.json"
-        )
-
+        meta_path = folder / "_assignment.json"
         if not meta_path.exists():
             continue
-
         try:
-            meta = json.loads(
-                meta_path.read_text(
-                    encoding="utf-8"
-                )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            assignments_by_slug.setdefault(
+                folder.name,
+                meta.get("assignment_name", folder.name),
             )
-
-            assignments.append(
-                (
-                    meta.get(
-                        "assignment_name",
-                        folder.name,
-                    ),
-                    folder.name,
-                )
-            )
-
         except Exception:
             continue
 
-    assignments.sort(
-        key=lambda item:
-            item[0].lower()
-    )
-
+    assignments = [(name, slug) for slug, name in assignments_by_slug.items()]
+    assignments.sort(key=lambda item: item[0].lower())
     return assignments
 
 
 def delete_assignment_by_slug(assignment_slug: str):
-    """Delete one stored assignment and its generated report for the current lecturer."""
-    stored = dict(
-        (slug, name)
-        for name, slug in list_stored_assignments()
-    )
-
+    """Delete one practical from Supabase and the local cache for this lecturer."""
+    stored = dict((slug, name) for name, slug in list_stored_assignments())
     if assignment_slug not in stored:
         raise ValueError("The selected practical no longer exists.")
 
     assignment_name = stored[assignment_slug]
+    user_id = st.session_state.get("user_id")
+    repo = supabase_repository()
+    cloud_error = None
+
+    if repo is not None and user_id:
+        try:
+            repo.delete_practical(str(user_id), assignment_slug)
+        except Exception as exc:
+            cloud_error = exc
+
     root = assignments_root().resolve()
     folder = (root / assignment_slug).resolve()
-
-    # Safety check: only delete a direct child of the current user's assignments folder.
     if folder.parent != root:
         raise ValueError("Invalid practical path.")
-
     if folder.exists():
         shutil.rmtree(folder)
 
-    report_path = (
-        reports_root()
-        / f"{slugify(assignment_name)}_EduCodeInsight_Report.docx"
-    )
-
+    report_path = reports_root() / f"{slugify(assignment_name)}_EduCodeInsight_Report.docx"
     if report_path.exists():
         report_path.unlink()
 
+    if cloud_error is not None:
+        raise RuntimeError(
+            "The local practical was deleted, but Supabase deletion failed: "
+            f"{type(cloud_error).__name__}: {cloud_error}"
+        )
     return assignment_name
 
 
 def load_assignment_by_slug(
     assignment_slug: str,
 ):
-    folder = (
-        assignments_root()
-        /
-        assignment_slug
-    )
+    """Load a practical from Supabase first, then fall back to local JSON."""
+    user_id = st.session_state.get("user_id")
+    repo = supabase_repository()
+    if repo is not None and user_id:
+        try:
+            cloud_results, cloud_meta = repo.load_practical(str(user_id), assignment_slug)
+            if cloud_results or cloud_meta:
+                return cloud_results, cloud_meta
+        except Exception:
+            pass
 
+    folder = assignments_root() / assignment_slug
     meta = {}
-
-    meta_path = (
-        folder
-        /
-        "_assignment.json"
-    )
-
+    meta_path = folder / "_assignment.json"
     if meta_path.exists():
         try:
-            meta = json.loads(
-                meta_path.read_text(
-                    encoding="utf-8"
-                )
-            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             meta = {}
 
     results = []
-
-    for result_path in sorted(
-        folder.glob(
-            "*.json"
-        )
-    ):
+    for result_path in sorted(folder.glob("*.json")):
         if result_path.name == "_assignment.json":
             continue
-
         try:
-            result = json.loads(
-                result_path.read_text(
-                    encoding="utf-8"
-                )
-            )
-
-            result.pop(
-                "_cache_key",
-                None,
-            )
-
-            results.append(
-                result
-            )
-
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result.pop("_cache_key", None)
+            result.pop("_audit_key", None)
+            results.append(result)
         except Exception:
             continue
-
-    return (
-        results,
-        meta,
-    )
+    return results, meta
 
 
 def load_all_assignment_runs():
@@ -3924,6 +3916,21 @@ def render_analyse():
             encoding="utf-8",
         )
 
+        # Persist the completed practical in Supabase. Local JSON remains a cache.
+        cloud_sync_error = None
+        repo = supabase_repository()
+        if repo is not None:
+            try:
+                practical_id = repo.save_practical(
+                    str(st.session_state.get("user_id")),
+                    assignment_name_clean,
+                    slugify(assignment_name_clean),
+                    meta,
+                )
+                repo.save_student_results(practical_id, results)
+            except Exception as exc:
+                cloud_sync_error = exc
+
         report_bytes = (
             assignment_report_docx(
                 assignment_name_clean,
@@ -3951,6 +3958,14 @@ def render_analyse():
         st.success(
             "Analysis complete."
         )
+
+        if cloud_sync_error is not None:
+            st.warning(
+                "Analysis was saved locally, but persistent Supabase sync failed. "
+                f"{type(cloud_sync_error).__name__}: {cloud_sync_error}"
+            )
+        elif repo is not None:
+            st.success("Results were also saved to persistent Supabase storage.")
 
         c1, c2, c3, c4 = (
             st.columns(
