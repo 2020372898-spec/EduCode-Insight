@@ -1,0 +1,1 @@
+"""EduCodeInsight Streamlit GUI package."""
