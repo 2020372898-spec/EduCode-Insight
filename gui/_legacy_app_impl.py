@@ -5,6 +5,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import time
 from io import BytesIO
 
@@ -1031,6 +1032,38 @@ def list_stored_assignments():
     )
 
     return assignments
+
+
+def delete_assignment_by_slug(assignment_slug: str):
+    """Delete one stored assignment and its generated report for the current lecturer."""
+    stored = dict(
+        (slug, name)
+        for name, slug in list_stored_assignments()
+    )
+
+    if assignment_slug not in stored:
+        raise ValueError("The selected practical no longer exists.")
+
+    assignment_name = stored[assignment_slug]
+    root = assignments_root().resolve()
+    folder = (root / assignment_slug).resolve()
+
+    # Safety check: only delete a direct child of the current user's assignments folder.
+    if folder.parent != root:
+        raise ValueError("Invalid practical path.")
+
+    if folder.exists():
+        shutil.rmtree(folder)
+
+    report_path = (
+        reports_root()
+        / f"{slugify(assignment_name)}_EduCodeInsight_Report.docx"
+    )
+
+    if report_path.exists():
+        report_path.unlink()
+
+    return assignment_name
 
 
 def load_assignment_by_slug(
@@ -2979,8 +3012,48 @@ def render_home():
         "assignment specification on the Analyse page. Review the "
         "classification prompt and the estimated runtime/cost before "
         "starting the analysis. Results are then available in the "
-        "assignment and overall Streamlit dashboards."
+        "assignment and overall  dashboards."
     )
+
+    st.subheader("Manage Practicals")
+
+    assignments = list_stored_assignments()
+
+    if not assignments:
+        st.info("No stored practicals are available to delete.")
+    else:
+        label_to_slug = {name: slug for name, slug in assignments}
+        selected_practical = st.selectbox(
+            "Select a practical to delete",
+            list(label_to_slug.keys()),
+            key="delete_practical_selection",
+        )
+
+        st.warning(
+            "Deleting a practical permanently removes its saved JSON analysis "
+            "results and its generated Word report. This action cannot be undone."
+        )
+
+        confirm_delete = st.checkbox(
+            f"I understand that {selected_practical} will be permanently deleted.",
+            key="confirm_delete_practical",
+        )
+
+        if st.button(
+            "Delete Practical",
+            type="primary",
+            disabled=not confirm_delete,
+            key="delete_practical_button",
+        ):
+            try:
+                deleted_name = delete_assignment_by_slug(
+                    label_to_slug[selected_practical]
+                )
+                st.success(f"{deleted_name} was deleted successfully.")
+                st.session_state["confirm_delete_practical"] = False
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not delete the practical: {exc}")
 
 
 # ============================================================
