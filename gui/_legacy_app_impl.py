@@ -3026,6 +3026,13 @@ def render_home():
             "results and its generated Word report. This action cannot be undone."
         )
 
+        # A Streamlit widget key cannot be modified after that widget has been
+        # instantiated during the same script run.  Deletion therefore sets a
+        # separate reset flag, and the checkbox is cleared at the start of the
+        # next rerun before the widget is created.
+        if st.session_state.pop("_reset_confirm_delete_practical", False):
+            st.session_state["confirm_delete_practical"] = False
+
         confirm_delete = st.checkbox(
             f"I understand that {selected_practical} will be permanently deleted.",
             key="confirm_delete_practical",
@@ -3042,7 +3049,9 @@ def render_home():
                     label_to_slug[selected_practical]
                 )
                 st.success(f"{deleted_name} was deleted successfully.")
-                st.session_state["confirm_delete_practical"] = False
+                # Do not mutate the checkbox's own key here; it has already
+                # been instantiated in this run. Reset it safely on rerun.
+                st.session_state["_reset_confirm_delete_practical"] = True
                 st.rerun()
             except Exception as exc:
                 st.error(f"Could not delete the practical: {exc}")
